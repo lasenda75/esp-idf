@@ -28,6 +28,12 @@ static String chipId4() {
   return String(s);
 }
 
+// --- Comunicación por cable con Placa B (UART) ---
+#define PIN_COM_RX 18
+#define PIN_COM_TX 19
+#define COM_BAUD   115200
+HardwareSerial SerialCom(1);
+
 SemaphoreHandle_t g_i2cMutex = nullptr;
 volatile uint32_t g_i2cQuietUntil = 0;
 inline bool i2cLock(uint32_t timeout_ms = 100) {
@@ -542,6 +548,418 @@ void apiEndpoints() {
   server.on("/api/ctrl", HTTP_POST, [](AsyncWebServerRequest * r) {
     if (!isAuth(r)) return;
     if (r->hasParam("p_start", true))  CTRL.p_start  = r->getParam("p_start", true)->value().toFloat();
+String urlDecode(const String& in) {
+  String out;
+  out.reserve(in.length());
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    if (c == '+') {
+      out += ' ';
+    } else if (c == '%' && i + 2 < in.length()) {
+      char h1 = in[i + 1];
+      char h2 = in[i + 2];
+      auto hex = [](char h) -> int {
+        if (h >= '0' && h <= '9') return h - '0';
+        if (h >= 'A' && h <= 'F') return h - 'A' + 10;
+        if (h >= 'a' && h <= 'f') return h - 'a' + 10;
+        return -1;
+      };
+      int hi = hex(h1);
+      int lo = hex(h2);
+      if (hi >= 0 && lo >= 0) {
+        out += char((hi << 4) | lo);
+        i += 2;
+      } else {
+        out += c;
+      }
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+bool getParamValue(const String& params, const String& key, String& value) {
+  int start = 0;
+  while (start < (int)params.length()) {
+    int eq = params.indexOf('=', start);
+    if (eq < 0) break;
+    String k = params.substring(start, eq);
+    int amp = params.indexOf('&', eq + 1);
+    if (amp < 0) amp = params.length();
+    if (k == key) {
+      value = urlDecode(params.substring(eq + 1, amp));
+      return true;
+    }
+    start = amp + 1;
+  }
+  return false;
+}
+
+struct SerialReply {
+  int code = 200;
+  String body;
+};
+
+SerialReply handleSerialApi(const String& method, const String& path, const String& params) {
+  SerialReply reply;
+
+  if ((path == "/api/estados" || path == "/api/state") && method == "GET") {
+    reply.body = jsonEstados();
+    return reply;
+  }
+
+  if (path == "/api/valvula/mode" && method == "POST") {
+    String m;
+    if (!getParamValue(params, "m", m)) {
+      reply.code = 400;
+      reply.body = "falta m";
+      return reply;
+    }
+    m.toLowerCase();
+    if      (m == "auto")  CFG.ev_mode = 0;
+    else if (m == "open")  CFG.ev_mode = 1;
+    else if (m == "close") CFG.ev_mode = 2;
+    saveCfg(); aplicarEV();
+    reply.body = "OK";
+    return reply;
+  }
+  if (path == "/api/valvula/auto" && method == "POST") {
+    CFG.ev_mode = 0; saveCfg(); aplicarEV(); reply.body = "OK"; return reply;
+  }
+  if (path == "/api/valvula/open" && method == "POST") {
+    CFG.ev_mode = 1; saveCfg(); aplicarEV(); reply.body = "OK"; return reply;
+  }
+  if (path == "/api/valvula/close" && method == "POST") {
+    CFG.ev_mode = 2; saveCfg(); aplicarEV(); reply.body = "OK"; return reply;
+  }
+
+  if (path == "/api/motor/mode" && method == "POST") {
+    String m;
+    if (!getParamValue(params, "m", m)) {
+      reply.code = 400;
+      reply.body = "falta m";
+      return reply;
+    }
+    m.toLowerCase();
+    if      (m == "auto") CFG.mot_mode = 0;
+    else if (m == "on")   CFG.mot_mode = 1;
+    else if (m == "off")  CFG.mot_mode = 2;
+    saveCfg(); aplicarMotor();
+    reply.body = "OK";
+    return reply;
+  }
+  if (path == "/api/motor/auto" && method == "POST") {
+    CFG.mot_mode = 0; saveCfg(); aplicarMotor(); reply.body = "OK"; return reply;
+  }
+  if (path == "/api/motor/start" && method == "POST") {
+    CFG.mot_mode = 1; saveCfg(); aplicarMotor(); reply.body = "OK"; return reply;
+  }
+  if (path == "/api/motor/stop" && method == "POST") {
+    CFG.mot_mode = 2; saveCfg(); aplicarMotor(); reply.body = "OK"; return reply;
+  }
+
+  if (path == "/api/unblock" && method == "POST") {
+    bool cond_ok = (!ST.humedad_wet) && (!ST.nivel_min || ST.nivel_opt);
+    if (cond_ok) {
+      CFG.bloqueo_activo = false;
+      saveCfg();
+      reply.body = "OK";
+    } else {
+      reply.code = 423;
+      reply.body = "Condicion insegura";
+    }
+    return reply;
+  }
+
+  if (path == "/api/cred" && method == "GET") {
+    DynamicJsonDocument d(160);
+    d["user"] = CFG.http_user;
+    d["pass"] = CFG.http_pass;
+    serializeJson(d, reply.body);
+    return reply;
+  }
+  if (path == "/api/cred" && method == "POST") {
+    String v;
+    if (getParamValue(params, "user", v)) CFG.http_user = v;
+    if (getParamValue(params, "pass", v)) CFG.http_pass = v;
+    saveCfg();
+    reply.body = "OK";
+    return reply;
+  }
+
+  if (path == "/api/ctrl" && method == "GET") {
+    DynamicJsonDocument d(200);
+    d["p_start"] = CTRL.p_start;
+    d["p_stop"] = CTRL.p_stop;
+    d["hz_min"] = CTRL.hz_min;
+    d["dwell_ms"] = CTRL.dwell_ms;
+    serializeJson(d, reply.body);
+    return reply;
+  }
+  if (path == "/api/ctrl" && method == "POST") {
+    String v;
+    if (getParamValue(params, "p_start", v)) CTRL.p_start = v.toFloat();
+    if (getParamValue(params, "p_stop", v))  CTRL.p_stop = v.toFloat();
+    if (getParamValue(params, "hz_min", v))  CTRL.hz_min = v.toFloat();
+    if (getParamValue(params, "dwell_ms", v)) CTRL.dwell_ms = v.toInt();
+    saveCtrl();
+    reply.body = "{\"ok\":true}";
+    return reply;
+  }
+
+  if (path == "/api/prot" && method == "GET") {
+    DynamicJsonDocument d(128);
+    d["in_s"] = PROT.in_s;
+    d["out_s"] = PROT.out_s;
+    serializeJson(d, reply.body);
+    return reply;
+  }
+  if (path == "/api/prot" && method == "POST") {
+    String v;
+    if (getParamValue(params, "in_s", v)) PROT.in_s = (uint16_t)v.toInt();
+    if (getParamValue(params, "out_s", v)) PROT.out_s = (uint16_t)v.toInt();
+    if (getParamValue(params, "vacio_s", v)) PROT.out_s = (uint16_t)v.toInt();
+    saveProt();
+    reply.body = "{\"ok\":true}";
+    return reply;
+  }
+
+  if (path == "/api/flow" && method == "GET") {
+    DynamicJsonDocument d(128);
+    d["k_in"] = CFG.flow_k_in;
+    d["k_out"] = CFG.flow_k_out;
+    serializeJson(d, reply.body);
+    return reply;
+  }
+  if (path == "/api/flow" && method == "POST") {
+    String v;
+    if (getParamValue(params, "k_in", v)) CFG.flow_k_in = v.toFloat();
+    if (getParamValue(params, "k_out", v)) CFG.flow_k_out = v.toFloat();
+    saveCfg();
+    reply.body = "OK";
+    return reply;
+  }
+
+  if (path == "/api/tg" && method == "GET") {
+    DynamicJsonDocument d(160);
+    d["token_ok"] = TG_TOKEN.length() > 10;
+    d["chat"] = TG_CHAT;
+    serializeJson(d, reply.body);
+    return reply;
+  }
+  if (path == "/api/tg" && method == "POST") {
+    String v;
+    bool changed = false;
+    if (getParamValue(params, "token", v) && v.length() > 10) {
+      TG_TOKEN = v;
+      changed = true;
+    }
+    if (getParamValue(params, "chat", v) && v.length() > 0) {
+      TG_CHAT = v;
+      changed = true;
+    }
+    if (changed) {
+      saveCfg();
+      delete tgBot;
+      tgBot = nullptr;
+    }
+    reply.body = "OK";
+    return reply;
+  }
+  if (path == "/api/tg/test" && method == "POST") {
+    String resp;
+    bool ok = tgSendDbg("Prueba Telegram desde Placa A", &resp);
+    DynamicJsonDocument d(256);
+    d["token_ok"] = TG_TOKEN.length() > 10;
+    d["chat_ok"] = TG_CHAT.length() > 0;
+    d["ok"] = ok;
+    d["response"] = resp;
+    serializeJson(d, reply.body);
+    reply.code = ok ? 200 : 500;
+    return reply;
+  }
+
+  if (path == "/api/relay/set" && method == "POST") {
+    String v;
+    if (!getParamValue(params, "ch", v)) { reply.code = 400; reply.body = "falta ch"; return reply; }
+    int ch = v.toInt();
+    if (!getParamValue(params, "on", v)) { reply.code = 400; reply.body = "falta on"; return reply; }
+    int on = v.toInt();
+    if (ch < 0 || ch > 5) { reply.code = 400; reply.body = "ch fuera de rango"; return reply; }
+    relayWrite((uint8_t)ch, on != 0);
+    reply.body = "OK";
+    return reply;
+  }
+  if (path == "/api/relay/pulse" && method == "POST") {
+    String v;
+    if (!getParamValue(params, "ch", v)) { reply.code = 400; reply.body = "falta ch"; return reply; }
+    int ch = v.toInt();
+    int ms = 500;
+    if (getParamValue(params, "ms", v)) ms = v.toInt();
+    if (ch < 0 || ch > 5) { reply.code = 400; reply.body = "ch fuera de rango"; return reply; }
+    relayWrite((uint8_t)ch, true); delay(ms); relayWrite((uint8_t)ch, false);
+    reply.body = "OK";
+    return reply;
+  }
+
+  if (path == "/api/relmap" && method == "GET") {
+    DynamicJsonDocument d(128);
+    d["ev_ch"] = CFG.ev_ch;
+    d["achq_ch"] = CFG.achq_ch;
+    d["rah"] = CFG.relays_active_high;
+    serializeJson(d, reply.body);
+    return reply;
+  }
+  if (path == "/api/relmap" && method == "POST") {
+    String v;
+    if (getParamValue(params, "ev", v)) {
+      int ch = v.toInt();
+      if (ch >= 0 && ch <= 5) CFG.ev_ch = ch;
+    }
+    if (getParamValue(params, "ach", v)) {
+      int ch = v.toInt();
+      if (ch >= 0 && ch <= 5) CFG.achq_ch = ch;
+    }
+    saveCfg();
+    reply.body = "OK";
+    return reply;
+  }
+  if (path == "/api/relpolarity" && method == "POST") {
+    String v;
+    if (!getParamValue(params, "rah", v)) { reply.code = 400; reply.body = "falta rah"; return reply; }
+    CFG.relays_active_high = (v.toInt() != 0);
+    saveCfg();
+    reply.body = "OK";
+    return reply;
+  }
+
+  if (path == "/api/debug/di" && method == "GET") {
+    DynamicJsonDocument d(128);
+    d["D1"] = diActive(0);
+    d["D2"] = diActive(1);
+    d["D3"] = diActive(2);
+    d["D4"] = diActive(3);
+    d["D5"] = diActive(4);
+    d["D6"] = diActive(5);
+    serializeJson(d, reply.body);
+    return reply;
+  }
+
+  if (path == "/api/debug/di8" && method == "GET") {
+    if (!i2cLock()) { reply.code = 503; reply.body = "I2C BUSY"; return reply; }
+    Wire.beginTransmission(0x22);
+    Wire.write(0xFF);
+    uint8_t errW = Wire.endTransmission();
+    delayMicroseconds(200);
+    Wire.requestFrom((uint8_t)0x22, (uint8_t)1);
+    if (Wire.available() < 1) {
+      i2cUnlock();
+      reply.code = 500;
+      reply.body = "no data";
+      return reply;
+    }
+    uint8_t port = Wire.read();
+    i2cUnlock();
+    DynamicJsonDocument d(200);
+    d["errW"] = errW;
+    d["port"] = port;
+    JsonObject P = d.createNestedObject("P");
+    for (int b = 0; b < 8; b++) P[String(b)] = (bool)((port >> b) & 1);
+    serializeJson(d, reply.body);
+    return reply;
+  }
+
+  if (path == "/api/config" && method == "GET") {
+    DynamicJsonDocument d(512);
+    d["vfd_id"]   = CFG.vfd_id;
+    d["vfd_baud"] = CFG.vfd_baud;
+    d["vfd_par"]  = "N";
+    d["reg_run"]  = VFD.reg_cmd;
+    d["reg_setf"] = VFD.reg_setf;
+    d["reg_outf"] = VFD.reg_r_out;
+    d["reg_pres"] = VFD.reg_press;
+    d["scale_f"]  = VFD.scale_hz;
+    d["scale_p"]  = VFD.scale_bar;
+    d["k_in"]     = CFG.flow_k_in;
+    d["k_out"]    = CFG.flow_k_out;
+    d["vfd_fmax_hz"] = CFG.vfd_fmax_hz;
+    serializeJson(d, reply.body);
+    return reply;
+  }
+  if (path == "/api/config" && method == "POST") {
+    String v;
+    if (getParamValue(params, "vfd_id", v)) CFG.vfd_id = (uint8_t)v.toInt();
+    if (getParamValue(params, "vfd_baud", v)) CFG.vfd_baud = (uint32_t)v.toInt();
+    if (getParamValue(params, "reg_run", v)) VFD.reg_cmd = (uint16_t)v.toInt();
+    if (getParamValue(params, "reg_setf", v)) VFD.reg_setf = (uint16_t)v.toInt();
+    if (getParamValue(params, "reg_outf", v)) VFD.reg_r_out = (uint16_t)v.toInt();
+    if (getParamValue(params, "reg_pres", v)) VFD.reg_press = (uint16_t)v.toInt();
+    if (getParamValue(params, "scale_f", v)) VFD.scale_hz = v.toFloat();
+    if (getParamValue(params, "scale_p", v)) VFD.scale_bar = v.toFloat();
+    if (getParamValue(params, "k_in", v)) CFG.flow_k_in = v.toFloat();
+    if (getParamValue(params, "k_out", v)) CFG.flow_k_out = v.toFloat();
+    if (getParamValue(params, "vfd_fmax_hz", v)) CFG.vfd_fmax_hz = v.toFloat();
+    saveCfg();
+    vfdBegin();
+    reply.body = "OK";
+    return reply;
+  }
+
+  if (path == "/api/vfd/read" && method == "GET") {
+    String v;
+    if (!getParamValue(params, "reg", v)) {
+      reply.code = 400;
+      reply.body = "falta reg";
+      return reply;
+    }
+    uint16_t reg = v.startsWith("0x")
+                   ? (uint16_t)strtoul(v.c_str(), nullptr, 16)
+                   : (uint16_t)v.toInt();
+    uint16_t val = 0;
+    bool ok = vfdRead03(reg, val);
+    DynamicJsonDocument d(160);
+    d["ok"] = ok;
+    d["reg"] = reg;
+    d["val"] = val;
+    d["hex"] = String("0x") + String(reg, 16);
+    serializeJson(d, reply.body);
+    reply.code = ok ? 200 : 500;
+    return reply;
+  }
+
+  reply.code = 404;
+  reply.body = "Not found";
+  return reply;
+}
+
+void handleSerialLine(const String& line) {
+  String trimmed = line;
+  trimmed.trim();
+  if (!trimmed.length()) return;
+
+  int firstSpace = trimmed.indexOf(' ');
+  if (firstSpace < 0) {
+    SerialCom.println("ERR 400 invalid");
+    return;
+  }
+  String method = trimmed.substring(0, firstSpace);
+  method.toUpperCase();
+
+  int secondSpace = trimmed.indexOf(' ', firstSpace + 1);
+  String path = secondSpace < 0 ? trimmed.substring(firstSpace + 1)
+                                : trimmed.substring(firstSpace + 1, secondSpace);
+  String params = secondSpace < 0 ? "" : trimmed.substring(secondSpace + 1);
+
+  SerialReply reply = handleSerialApi(method, path, params);
+  if (reply.code == 200) {
+    if (reply.body.length()) SerialCom.println("OK " + reply.body);
+    else SerialCom.println("OK");
+  } else {
+    SerialCom.println("ERR " + String(reply.code) + " " + reply.body);
+  }
+}
+
     if (r->hasParam("p_stop",  true))  CTRL.p_stop   = r->getParam("p_stop",  true)->value().toFloat();
     if (r->hasParam("hz_min",  true))  CTRL.hz_min   = r->getParam("hz_min",  true)->value().toFloat();
     if (r->hasParam("dwell_ms", true))  CTRL.dwell_ms = r->getParam("dwell_ms", true)->value().toInt();
@@ -1008,7 +1426,15 @@ uint32_t tPoll = 0, tFlow = 0;
   });
 
   server.on("/api/tg", HTTP_GET, [](AsyncWebServerRequest* r){
-    DynamicJsonDocument d(160);
+  ST.ev_txt = "Electrovalvula: Cerrada";
+
+  SerialCom.begin(COM_BAUD, SERIAL_8N1, PIN_COM_RX, PIN_COM_TX);
+  SerialCom.setTimeout(80);
+  if (SerialCom.available()) {
+    String line = SerialCom.readStringUntil('\n');
+    handleSerialLine(line);
+  }
+
     d["token_ok"] = TG_TOKEN.length() > 10;
     d["chat"] = TG_CHAT;
     String s; serializeJson(d, s); r->send(200, "application/json", s);
