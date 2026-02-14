@@ -29,6 +29,7 @@ static String chipId4() {
 #define PIN_COM_RX 18
 #define PIN_COM_TX 19
 #define COM_BAUD   115200
+#define COM_TIMEOUT_MS 160
 HardwareSerial SerialCom(1);
 
 // ----------------- Globals -----------------
@@ -102,6 +103,17 @@ SerialReply serialRequest(const String& method, const String& path, const String
   if (resp.startsWith("OK ")) {
     reply.code = 200;
     reply.body = resp.substring(3);
+static String mergeParams(const String& a, const String& b) {
+  if (!a.length()) return b;
+  if (!b.length()) return a;
+  return a + "&" + b;
+}
+
+
+  while (SerialCom.available()) {
+    (void)SerialCom.read();
+  }
+
     return reply;
   }
   if (resp.startsWith("ERR")) {
@@ -118,15 +130,49 @@ SerialReply serialRequest(const String& method, const String& path, const String
   reply.body = resp;
   return reply;
 static void sendProxyResponse(AsyncWebServerRequest* r, int code, const String& body) {
-  String ctype = body.startsWith("{") ? "application/json" : "text/plain";
+  String trimmed = body;
+  trimmed.trim();
+  String ctype = (trimmed.startsWith("{") || trimmed.startsWith("[")) ? "application/json" : "text/plain";
 
 // ----------------- API (UART) -----------------
+    d["uart_rx"] = PIN_COM_RX;
+    d["uart_tx"] = PIN_COM_TX;
+    d["uart_baud"] = COM_BAUD;
+  server.on("/api/b/ota", HTTP_GET, [](AsyncWebServerRequest* r){
+    if(!isAuth(r)) return;
+    DynamicJsonDocument d(256);
+    d["ota_b_url"] = "/update";
+    d["ota_a_url"] = A_BASE + "/update";
+    d["ota_panel"] = "/ota";
+    String s; serializeJson(d, s);
+    r->send(200, "application/json", s);
+  });
+
+  server.on("/api/b/a_base", HTTP_POST, [](AsyncWebServerRequest* r){
+    if(!isAuth(r)) return;
+    if (!r->hasParam("a_base", true)) {
+      r->send(400, "text/plain", "falta a_base");
+      return;
+    }
+    String v = r->getParam("a_base", true)->value();
+    v.trim();
+    if (!v.length()) {
+      r->send(400, "text/plain", "a_base vacio");
+      return;
+    }
+    if (!v.startsWith("http")) v = "http://" + v;
+    A_BASE = v;
+    saveB();
+    r->send(200, "application/json", "{\"ok\":true}");
+  });
+
   auto serialGet = [&](const char* path){
       SerialReply rep = serialRequest("GET", path, query);
       sendProxyResponse(r, rep.code, rep.body);
   auto serialPost = [&](const char* path){
+      String query = buildQuery(r);
       String form = buildForm(r);
-      SerialReply rep = serialRequest("POST", path, form);
+      SerialReply rep = serialRequest("POST", path, mergeParams(query, form));
       sendProxyResponse(r, rep.code, rep.body);
   serialGet("/api/estados");
   serialGet("/api/state");
@@ -311,9 +357,8 @@ void setupAPI() {
 
     // Tarjeta 2: Actualizar HARDWARE (Parte A)
     h += "<div class='card'><h2>2. Actualizar Hardware (A)</h2>";
-    h += "<p>Sube <b>Hardware_Controller_A.ino.bin</b>.</p>";
-    h += "<p><small>Destino: " + A_BASE + "/update</small></p>";
-    h += "<form method='POST' action='" + A_BASE + "/update' enctype='multipart/form-data'><input type='file' name='update'><input type='submit' value='Actualizar A'></form></div>";
+  SerialCom.setTimeout(COM_TIMEOUT_MS);
+  // El servidor web es asincrono
 
     h += "<br><a href='/'>&larr; Volver al Panel</a></body></html>";
     r->send(200, "text/html", h);
