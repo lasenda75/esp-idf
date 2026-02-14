@@ -19,6 +19,9 @@
 
 #include <ESPmDNS.h>
 
+// Forward declaration para evitar fallo del auto-prototipado de Arduino
+struct SerialReply;
+
 static String chipId4() {
   uint32_t id = (uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF);
   char s[6]; snprintf(s, sizeof(s), "%04X", (uint16_t)id);
