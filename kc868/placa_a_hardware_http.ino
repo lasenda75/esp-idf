@@ -29,8 +29,8 @@ static String chipId4() {
 }
 
 // --- Comunicación por cable con Placa B (UART) ---
-#define PIN_COM_RX 18
-#define PIN_COM_TX 19
+#define PIN_COM_RX 17
+#define PIN_COM_TX 16
 #define COM_BAUD   115200
 HardwareSerial SerialCom(1);
 
