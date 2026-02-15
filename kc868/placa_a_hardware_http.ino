@@ -21,6 +21,9 @@
 #include "esp_task_wdt.h"
 #include <stdlib.h>
 
+// Forward declaration para el auto-prototipado de Arduino
+struct SerialReply;
+
 static String chipId4() {
   uint32_t id = (uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF);
   char s[6];
