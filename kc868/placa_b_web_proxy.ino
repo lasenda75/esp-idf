@@ -1,9 +1,9 @@
-/**************** PLACA B  WEB + UART HACIA PLACA A  *****************
+/**************** PLACA B - WEB + PROXY HTTP HACIA PLACA A ***************
    - Sirve la web desde SPIFFS (frontend)
-   - Mantiene autenticacin (BasicAuth)
-   - Expone /api/* para el frontend y reenva por UART a A
-   - OTA local para B + panel que enva a A por HTTP (/update)
-*************************************************************************/
+   - Mantiene autenticación (BasicAuth)
+   - Expone /api/* para el frontend y reenvía a A por HTTP
+   - OTA local para B + panel para OTA de A por navegador
+***************************************************************************/
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -16,11 +16,9 @@
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <Update.h>
+#include <HTTPClient.h>
 
 #include <ESPmDNS.h>
-
-// Forward declaration para evitar fallo del auto-prototipado de Arduino
-struct SerialReply;
 
 static String chipId4() {
   uint32_t id = (uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF);
@@ -28,22 +26,12 @@ static String chipId4() {
   return String(s);
 }
 
-// ----------------- UART hacia A -----------------
-#define PIN_COM_RX 17
-#define PIN_COM_TX 16
-#define COM_BAUD   115200
-#define COM_TIMEOUT_MS 160
-HardwareSerial SerialCom(1);
-
 // ----------------- Globals -----------------
 AsyncWebServer server(80);
 Preferences prefs;
 
-// Credenciales (auth web en B)
 String HTTP_USER = "admin";
 String HTTP_PASS = "1234";
-
-// Direccin de A (para OTA en el navegador)
 String A_BASE = "http://hardware_a.local";
 
 // ----------------- Auth -----------------
@@ -64,6 +52,7 @@ void loadB() {
   A_BASE    = prefs.getString("a", A_BASE);
   prefs.end();
 }
+
 void saveB() {
   prefs.begin("b", false);
   prefs.putString("u", HTTP_USER);
@@ -72,165 +61,131 @@ void saveB() {
   prefs.end();
 }
 
-// ----------------- Helper: URL Encode -----------------
-static String buildForm(AsyncWebServerRequest* r) {
-    if (!p->isFile() && p->isPost()) {
-  }
-  return form;
+// ----------------- URL helpers -----------------
+String urlEncode(const String& str) {
+  String out;
+    if (c == ' ') out += '+';
+    else if (isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' || c == '~') out += c;
+    else {
+      code1 = (c & 0x0f) + '0';
+      if ((c & 0x0f) > 9) code1 = (c & 0x0f) - 10 + 'A';
+      c = (c >> 4) & 0x0f;
+      if (c > 9) code0 = c - 10 + 'A';
+      out += '%'; out += code0; out += code1;
+  return out;
+String joinUrl(const String& base, const String& pathAndQuery) {
+  if (base.endsWith("/") && pathAndQuery.startsWith("/")) return base + pathAndQuery.substring(1);
+  if (!base.endsWith("/") && !pathAndQuery.startsWith("/")) return base + "/" + pathAndQuery;
+  return base + pathAndQuery;
+String buildQuery(AsyncWebServerRequest* r, bool includePost) {
+  String q;
+    if (p->isFile()) continue;
+    if (p->isPost() != includePost) continue;
+    if (q.length()) q += '&';
+    q += p->name();
+    q += '=';
+    q += urlEncode(p->value());
+  return q;
+String mergeParams(const String& a, const String& b) {
+void sendProxyResponse(AsyncWebServerRequest* r, int code, const String& ct, const String& body) {
+  String contentType = ct.length() ? ct : "text/plain";
+  r->send((code > 0) ? code : 500, contentType, body);
 }
 
-struct SerialReply {
-  int code = 500;
-  String body;
-};
-
-SerialReply serialRequest(const String& method, const String& path, const String& params) {
-  SerialReply reply;
-  String line = method + " " + path;
-  if (params.length()) line += " " + params;
-  SerialCom.println(line);
-
-  String resp = SerialCom.readStringUntil('\n');
-  resp.trim();
-  if (!resp.length()) {
-    reply.code = 504;
-    reply.body = "timeout";
-    return reply;
-  }
-
-  if (resp == "OK") {
-    reply.code = 200;
-    reply.body = "";
-    return reply;
-  }
-  if (resp.startsWith("OK ")) {
-    reply.code = 200;
-    reply.body = resp.substring(3);
-static String mergeParams(const String& a, const String& b) {
-  if (!a.length()) return b;
-  if (!b.length()) return a;
-  return a + "&" + b;
+bool proxyGET(const String& path, AsyncWebServerRequest* req, int& code, String& ct, String& body) {
+  HTTPClient http;
+  String q = buildQuery(req, false);
+  String target = path;
+  if (q.length()) target += "?" + q;
+  String url = joinUrl(A_BASE, target);
+  http.setTimeout(3000);
+  if (!http.begin(url)) {
+    code = 500; ct = "text/plain"; body = "HTTP begin fail";
+    return false;
+  code = http.GET();
+  ct = http.header("Content-Type");
+  body = http.getString();
+  http.end();
+  return code > 0;
 }
+bool proxyPOSTForm(const String& path, AsyncWebServerRequest* req, int& code, String& ct, String& body) {
+  HTTPClient http;
+  String form = mergeParams(buildQuery(req, false), buildQuery(req, true));
+  String url = joinUrl(A_BASE, path);
+  http.setTimeout(3000);
+  if (!http.begin(url)) {
+    code = 500; ct = "text/plain"; body = "HTTP begin fail";
+    return false;
 
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  code = http.POST((uint8_t*)form.c_str(), form.length());
+  ct = http.header("Content-Type");
+  body = http.getString();
+  http.end();
+  return code > 0;
 
-  while (SerialCom.available()) {
-    (void)SerialCom.read();
-  }
+  server.serveStatic("/config.js", SPIFFS, "/config.js").setCacheControl("no-cache, no-store, must-revalidate");
+  server.serveStatic("/credentials.js", SPIFFS, "/credentials.js").setCacheControl("no-cache, no-store, must-revalidate");
+  server.serveStatic("/overlay_salida.png", SPIFFS, "/overlay_salida.png");
+  server.serveStatic("/overlay_bypass.png", SPIFFS, "/overlay_bypass.png");
+// ----------------- API -----------------
+    d["ota_b_url"] = String("http://") + WiFi.localIP().toString() + "/update";
+    if (!v.startsWith("http://") && !v.startsWith("https://")) v = "http://" + v;
+    r->send(200, "text/plain", "OK");
+  auto proxyGet = [&](const char* path){
+      int code; String ct; String body;
+      proxyGET(path, r, code, ct, body);
+      sendProxyResponse(r, code, ct, body);
+  auto proxyPost = [&](const char* path){
+      int code; String ct; String body;
+      proxyPOSTForm(path, r, code, ct, body);
+      sendProxyResponse(r, code, ct, body);
+  proxyGet("/api/estados");
+  proxyGet("/api/state");
+  proxyPost("/api/valvula/mode");
+  proxyPost("/api/valvula/open");
+  proxyPost("/api/valvula/close");
+  proxyPost("/api/valvula/auto");
+  proxyPost("/api/motor/mode");
+  proxyPost("/api/motor/start");
+  proxyPost("/api/motor/stop");
+  proxyPost("/api/motor/auto");
+  proxyPost("/api/unblock");
+  proxyGet("/api/config");
+  proxyPost("/api/config");
+  proxyGet("/api/ctrl");
+  proxyPost("/api/ctrl");
+  proxyGet("/api/prot");
+  proxyPost("/api/prot");
+  proxyGet("/api/flow");
+  proxyPost("/api/flow");
+  proxyGet("/api/cred");
+    int code; String ct; String body;
+    proxyPOSTForm("/api/cred", r, code, ct, body);
+    sendProxyResponse(r, (code > 0 ? code : 200), ct.length() ? ct : "text/plain", body.length() ? body : "OK");
+  proxyGet("/api/tg");
+  proxyPost("/api/tg");
+  proxyPost("/api/tg/test");
+  proxyPost("/api/relay/set");
+  proxyPost("/api/relay/pulse");
+  proxyGet("/api/debug/di");
+  proxyGet("/api/debug/di8");
+  proxyGet("/api/vfd/read");
+  proxyGet("/api/relmap");
+  proxyPost("/api/relmap");
+  proxyPost("/api/relpolarity");
+  // OTA en B
+  // Panel OTA
+    h += "<p>Sube <b>firmware B</b> o <b>SPIFFS</b>.</p>";
 
-    return reply;
-  }
-  if (resp.startsWith("ERR")) {
-    int first = resp.indexOf(' ');
-    int second = resp.indexOf(' ', first + 1);
-    if (second > 0) {
-      reply.code = resp.substring(first + 1, second).toInt();
-      reply.body = resp.substring(second + 1);
-    } else {
-      reply.code = 500;
-      reply.body = resp;
-    return reply;
-  reply.code = 500;
-  reply.body = resp;
-  return reply;
-static void sendProxyResponse(AsyncWebServerRequest* r, int code, const String& body) {
-  String trimmed = body;
-  trimmed.trim();
-  String ctype = (trimmed.startsWith("{") || trimmed.startsWith("[")) ? "application/json" : "text/plain";
+    h += "<p>Sube <b>firmware A</b>.</p>";
+    h += "<br><a href='/'>← Volver</a></body></html>";
+  String host = "web-gw-" + chipId4();
+    if (!newA.startsWith("http://") && !newA.startsWith("https://")) newA = "http://" + newA;
+  Serial.print("Target A: "); Serial.println(A_BASE);
 
-// ----------------- API (UART) -----------------
-    d["uart_rx"] = PIN_COM_RX;
-    d["uart_tx"] = PIN_COM_TX;
-    d["uart_baud"] = COM_BAUD;
-  server.on("/api/b/ota", HTTP_GET, [](AsyncWebServerRequest* r){
-    if(!isAuth(r)) return;
-    DynamicJsonDocument d(256);
-    d["ota_b_url"] = "/update";
-    d["ota_a_url"] = A_BASE + "/update";
-    d["ota_panel"] = "/ota";
-    String s; serializeJson(d, s);
-    r->send(200, "application/json", s);
-  });
-
-  server.on("/api/b/a_base", HTTP_POST, [](AsyncWebServerRequest* r){
-    if(!isAuth(r)) return;
-    if (!r->hasParam("a_base", true)) {
-      r->send(400, "text/plain", "falta a_base");
-      return;
-    }
-    String v = r->getParam("a_base", true)->value();
-    v.trim();
-    if (!v.length()) {
-      r->send(400, "text/plain", "a_base vacio");
-      return;
-    }
-    if (!v.startsWith("http")) v = "http://" + v;
-    A_BASE = v;
-    saveB();
-    r->send(200, "application/json", "{\"ok\":true}");
-  });
-
-  auto serialGet = [&](const char* path){
-      SerialReply rep = serialRequest("GET", path, query);
-      sendProxyResponse(r, rep.code, rep.body);
-  auto serialPost = [&](const char* path){
-      String query = buildQuery(r);
-      String form = buildForm(r);
-      SerialReply rep = serialRequest("POST", path, mergeParams(query, form));
-      sendProxyResponse(r, rep.code, rep.body);
-  serialGet("/api/estados");
-  serialGet("/api/state");
-
-  serialPost("/api/valvula/mode");
-  serialPost("/api/valvula/open");
-  serialPost("/api/valvula/close");
-  serialPost("/api/valvula/auto");
-  serialPost("/api/motor/mode");
-  serialPost("/api/motor/start");
-  serialPost("/api/motor/stop");
-  serialPost("/api/motor/auto");
-  serialPost("/api/unblock");
-  serialGet("/api/config");
-  serialPost("/api/config");
-  serialGet("/api/ctrl");
-  serialPost("/api/ctrl");
-  serialGet("/api/prot");
-  serialPost("/api/prot");
-  serialGet("/api/flow");
-  serialPost("/api/flow");
-  serialGet("/api/cred");
-    String form = buildForm(r);
-    SerialReply rep = serialRequest("POST", "/api/cred", form);
-    sendProxyResponse(r, rep.code, rep.body.length() ? rep.body : "OK");
-  serialGet("/api/tg");
-  serialPost("/api/tg");
-  serialPost("/api/tg/test");
-  serialPost("/api/relay/set");
-  serialPost("/api/relay/pulse");
-  serialGet("/api/debug/di");
-  serialGet("/api/debug/di8");
-  serialGet("/api/vfd/read");
-
-  serialGet("/api/relmap");
-  serialPost("/api/relmap");
-  serialPost("/api/relpolarity");
-  });
-    if(!isAuth(r)) return;
-
-  SerialCom.begin(COM_BAUD, SERIAL_8N1, PIN_COM_RX, PIN_COM_TX);
-  SerialCom.setTimeout(120);
-
-  Serial.print("Target OTA A: "); Serial.println(A_BASE);
-
-  // El servidor web es as
-ncrono
-  server.serveStatic("/styles.css", SPIFFS, "/styles.css");
-  server.serveStatic("/scripts.js", SPIFFS, "/scripts.js").setCacheControl("no-cache, no-store, must-revalidate");
-  server.serveStatic("/config.html", SPIFFS, "/config.html");
-  server.serveStatic("/config.js",   SPIFFS, "/config.js").setCacheControl("no-cache, no-store, must-revalidate");
-  server.serveStatic("/credentials.html", SPIFFS, "/credentials.html");
-  server.serveStatic("/credentials.js",   SPIFFS, "/credentials.js").setCacheControl("no-cache, no-store, must-revalidate");
-
-  // Imgenes del plano
+  // asíncrono
+genes del plano
   server.serveStatic("/plano.png", SPIFFS, "/plano.png");
   server.serveStatic("/overlay_entrada.png", SPIFFS, "/overlay_entrada.png");
   server.serveStatic("/overlay_salida.png",  SPIFFS, "/overlay_salida.png");
